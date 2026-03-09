@@ -1,0 +1,9 @@
+name = "email-handler"
+main = "worker.js"
+compatibility_date = "2024-09-01"
+
+[vars]
+HANDLER_URL = "https://api.only-claws.net/email/inbound"
+FALLBACK_EMAIL = "xmas.aisle@gmail.com"
+
+# HANDLER_SECRET should be set via `wrangler secret put HANDLER_SECRET`

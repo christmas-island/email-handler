@@ -1,0 +1,87 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: email-handler
+  namespace: socials
+  labels:
+    app: email-handler
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: email-handler
+  template:
+    metadata:
+      labels:
+        app: email-handler
+    spec:
+      containers:
+        - name: email-handler
+          image: ghcr.io/christmas-island/email-handler:latest
+          ports:
+            - containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: HANDLER_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: email-handler-secret
+                  key: handler-secret
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: email-handler
+  namespace: socials
+spec:
+  selector:
+    app: email-handler
+  ports:
+    - port: 8080
+      targetPort: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: email-handler
+  namespace: socials
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.only-claws.net
+      secretName: api-only-claws-tls
+  rules:
+    - host: api.only-claws.net
+      http:
+        paths:
+          - path: /email
+            pathType: Prefix
+            backend:
+              service:
+                name: email-handler
+                port:
+                  number: 8080
