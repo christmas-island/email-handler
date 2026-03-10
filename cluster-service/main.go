@@ -148,27 +148,30 @@ func postToDiscord(email InboundEmail, otps []OTPMatch) {
 		sb.WriteString(fmt.Sprintf("<@%s> ", discordID))
 	}
 
-	sb.WriteString(fmt.Sprintf("📧 **New email for `%s`**\n", email.To))
-	sb.WriteString(fmt.Sprintf("**From:** %s\n", email.From))
+	sb.WriteString(fmt.Sprintf("📧 **%s** → `%s`\n", email.From, email.To))
 	sb.WriteString(fmt.Sprintf("**Subject:** %s\n", email.Subject))
 
 	if len(otps) > 0 {
-		sb.WriteString("\n🔑 **Extracted codes/links:**\n")
-		for _, otp := range otps {
+		sb.WriteString("\n🔑 ")
+		for i, otp := range otps {
+			if i > 0 {
+				sb.WriteString(" | ")
+			}
 			if otp.Type == "otp" {
-				sb.WriteString(fmt.Sprintf("- **OTP:** `%s`\n", otp.Code))
+				sb.WriteString(fmt.Sprintf("`%s`", otp.Code))
 			} else {
-				sb.WriteString(fmt.Sprintf("- **Link:** <%s>\n", otp.Code))
+				sb.WriteString(fmt.Sprintf("<%s>", otp.Code))
 			}
 		}
+		sb.WriteString("\n")
 	}
 
 	body := extractBody(email.Raw)
-	if len(body) > 500 {
-		body = body[:500] + "..."
+	if len(body) > 800 {
+		body = body[:800] + "…"
 	}
 	if body != "" {
-		sb.WriteString(fmt.Sprintf("\n```\n%s\n```", body))
+		sb.WriteString("\n" + body)
 	}
 
 	payload := map[string]interface{}{
