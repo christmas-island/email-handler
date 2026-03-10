@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,7 +12,11 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	_ "github.com/lib/pq"
 )
+
+var db *sql.DB
 
 // InboundEmail represents an email forwarded from the Cloudflare Worker
 type InboundEmail struct {
@@ -25,8 +31,20 @@ type InboundEmail struct {
 // OTPMatch represents an extracted OTP/verification code
 type OTPMatch struct {
 	Code   string `json:"code"`
-	Type   string `json:"type"` // "otp", "verification_link", "magic_link"
+	Type   string `json:"type"`
 	Source string `json:"source"`
+}
+
+// StoredEmail is what we return from queries
+type StoredEmail struct {
+	ID          string     `json:"id"`
+	Recipient   string     `json:"recipient"`
+	LocalPart   string     `json:"localPart"`
+	Sender      string     `json:"sender"`
+	Subject     string     `json:"subject"`
+	ReceivedAt  time.Time  `json:"receivedAt"`
+	ProcessedAt time.Time  `json:"processedAt"`
+	Codes       []OTPMatch `json:"codes,omitempty"`
 }
 
 // Common OTP patterns
@@ -38,7 +56,6 @@ var otpPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)enter (?:the )?(?:code|otp)[:\s]+(\d{4,8})`),
 }
 
-// Verification link patterns
 var linkPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(https?://[^\s"<]+(?:verify|confirm|activate|auth|token|magic)[^\s"<]*)`),
 }
@@ -51,11 +68,7 @@ func extractOTPs(body string) []OTPMatch {
 		for _, match := range pattern.FindAllStringSubmatch(body, -1) {
 			if len(match) > 1 && !seen[match[1]] {
 				seen[match[1]] = true
-				matches = append(matches, OTPMatch{
-					Code:   match[1],
-					Type:   "otp",
-					Source: match[0],
-				})
+				matches = append(matches, OTPMatch{Code: match[1], Type: "otp", Source: match[0]})
 			}
 		}
 	}
@@ -64,11 +77,7 @@ func extractOTPs(body string) []OTPMatch {
 		for _, match := range pattern.FindAllStringSubmatch(body, -1) {
 			if len(match) > 0 && !seen[match[0]] {
 				seen[match[0]] = true
-				matches = append(matches, OTPMatch{
-					Code:   match[0],
-					Type:   "verification_link",
-					Source: match[0],
-				})
+				matches = append(matches, OTPMatch{Code: match[0], Type: "verification_link", Source: match[0]})
 			}
 		}
 	}
@@ -76,20 +85,54 @@ func extractOTPs(body string) []OTPMatch {
 	return matches
 }
 
+// storeEmail persists the email and extracted codes to CockroachDB
+func storeEmail(email InboundEmail, otps []OTPMatch) (string, error) {
+	if db == nil {
+		return "", fmt.Errorf("database not connected")
+	}
+
+	receivedAt, err := time.Parse(time.RFC3339, email.ReceivedAt)
+	if err != nil {
+		receivedAt = time.Now().UTC()
+	}
+
+	var emailID string
+	err = db.QueryRowContext(context.Background(),
+		`INSERT INTO inbound_emails (recipient, local_part, sender, subject, raw_body, received_at)
+		 VALUES ($1, $2, $3, $4, $5, $6)
+		 RETURNING id`,
+		email.To, email.LocalPart, email.From, email.Subject, email.Raw, receivedAt,
+	).Scan(&emailID)
+	if err != nil {
+		return "", fmt.Errorf("insert email: %w", err)
+	}
+
+	for _, otp := range otps {
+		_, err := db.ExecContext(context.Background(),
+			`INSERT INTO extracted_codes (email_id, code, code_type, source)
+			 VALUES ($1, $2, $3, $4)`,
+			emailID, otp.Code, otp.Type, otp.Source,
+		)
+		if err != nil {
+			log.Printf("[DB] Failed to insert code for email %s: %v", emailID, err)
+		}
+	}
+
+	log.Printf("[DB] Stored email %s for %s (%d codes)", emailID, email.LocalPart, len(otps))
+	return emailID, nil
+}
+
 // postToDiscord sends an email notification to the Discord #email channel via webhook
 func postToDiscord(email InboundEmail, otps []OTPMatch) {
 	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
 	if webhookURL == "" {
-		log.Println("[DISCORD] No webhook URL configured, skipping notification")
 		return
 	}
 
-	// Build the message
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("📧 **New email for `%s`**\n", email.To))
 	sb.WriteString(fmt.Sprintf("**From:** %s\n", email.From))
 	sb.WriteString(fmt.Sprintf("**Subject:** %s\n", email.Subject))
-	sb.WriteString(fmt.Sprintf("**Received:** %s\n", email.ReceivedAt))
 
 	if len(otps) > 0 {
 		sb.WriteString("\n🔑 **Extracted codes/links:**\n")
@@ -102,7 +145,6 @@ func postToDiscord(email InboundEmail, otps []OTPMatch) {
 		}
 	}
 
-	// Extract a preview from the raw email (skip headers, first 500 chars of body)
 	body := extractBody(email.Raw)
 	if len(body) > 500 {
 		body = body[:500] + "..."
@@ -116,12 +158,7 @@ func postToDiscord(email InboundEmail, otps []OTPMatch) {
 		"username": "📧 Email Handler",
 	}
 
-	jsonPayload, err := json.Marshal(payload)
-	if err != nil {
-		log.Printf("[DISCORD] Failed to marshal payload: %v", err)
-		return
-	}
-
+	jsonPayload, _ := json.Marshal(payload)
 	resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(jsonPayload))
 	if err != nil {
 		log.Printf("[DISCORD] Failed to post: %v", err)
@@ -136,9 +173,7 @@ func postToDiscord(email InboundEmail, otps []OTPMatch) {
 	}
 }
 
-// extractBody tries to get the text body from a raw email, skipping headers
 func extractBody(raw string) string {
-	// Find the blank line separating headers from body
 	parts := strings.SplitN(raw, "\r\n\r\n", 2)
 	if len(parts) == 2 {
 		return strings.TrimSpace(parts[1])
@@ -156,7 +191,6 @@ func handleInbound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Auth check
 	secret := os.Getenv("HANDLER_SECRET")
 	if secret != "" {
 		auth := r.Header.Get("Authorization")
@@ -175,7 +209,6 @@ func handleInbound(w http.ResponseWriter, r *http.Request) {
 	log.Printf("[INBOUND] to=%s from=%s subject=%q localPart=%s",
 		email.To, email.From, email.Subject, email.LocalPart)
 
-	// Extract OTP codes
 	otps := extractOTPs(email.Raw)
 	if len(otps) > 0 {
 		log.Printf("[OTP] Found %d codes/links for %s:", len(otps), email.LocalPart)
@@ -184,35 +217,36 @@ func handleInbound(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Post to Discord #email channel
-	go postToDiscord(email, otps)
-
-	// Store email record (TODO: persist to DB)
-	record := map[string]interface{}{
-		"to":          email.To,
-		"from":        email.From,
-		"subject":     email.Subject,
-		"localPart":   email.LocalPart,
-		"receivedAt":  email.ReceivedAt,
-		"processedAt": time.Now().UTC().Format(time.RFC3339),
-		"otps":        otps,
+	// Store in CockroachDB
+	emailID, err := storeEmail(email, otps)
+	if err != nil {
+		log.Printf("[DB] Failed to store: %v", err)
 	}
-	_ = record
+
+	// Post to Discord
+	go postToDiscord(email, otps)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"ok":        true,
+		"id":        emailID,
 		"recipient": email.LocalPart,
 		"otps":      otps,
 	})
 }
 
 func handleHealth(w http.ResponseWriter, r *http.Request) {
+	status := "ok"
+	if db != nil {
+		if err := db.Ping(); err != nil {
+			status = "degraded (db unreachable)"
+		}
+	}
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	json.NewEncoder(w).Encode(map[string]string{"status": status})
 }
 
-// handleQuery lets claws check their inbox for recent OTPs
+// handleQuery lets claws check their inbox
 func handleQuery(w http.ResponseWriter, r *http.Request) {
 	localPart := strings.TrimPrefix(r.URL.Path, "/email/query/")
 	if localPart == "" {
@@ -220,13 +254,79 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// TODO: query stored emails for this localPart
+	if db == nil {
+		http.Error(w, "database not connected", http.StatusServiceUnavailable)
+		return
+	}
+
+	rows, err := db.QueryContext(context.Background(),
+		`SELECT e.id, e.recipient, e.local_part, e.sender, e.subject, e.received_at, e.processed_at
+		 FROM inbound_emails e
+		 WHERE e.local_part = $1
+		 ORDER BY e.received_at DESC
+		 LIMIT 10`, localPart)
+	if err != nil {
+		http.Error(w, "query failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var emails []StoredEmail
+	for rows.Next() {
+		var e StoredEmail
+		if err := rows.Scan(&e.ID, &e.Recipient, &e.LocalPart, &e.Sender, &e.Subject, &e.ReceivedAt, &e.ProcessedAt); err != nil {
+			continue
+		}
+
+		// Fetch codes for this email
+		codeRows, err := db.QueryContext(context.Background(),
+			`SELECT code, code_type, source FROM extracted_codes WHERE email_id = $1`, e.ID)
+		if err == nil {
+			for codeRows.Next() {
+				var c OTPMatch
+				if err := codeRows.Scan(&c.Code, &c.Type, &c.Source); err == nil {
+					e.Codes = append(e.Codes, c)
+				}
+			}
+			codeRows.Close()
+		}
+
+		emails = append(emails, e)
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"ok":        true,
 		"recipient": localPart,
-		"message":   "not yet implemented — needs DB backend",
+		"count":     len(emails),
+		"emails":    emails,
 	})
+}
+
+func initDB() {
+	dsn := os.Getenv("DATABASE_URL")
+	if dsn == "" {
+		dsn = "postgresql://root@cockroachdb-public.cockroachdb.svc.cluster.local:26257/email?sslmode=disable"
+	}
+
+	var err error
+	db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		log.Printf("[DB] Failed to open: %v", err)
+		return
+	}
+
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
+	if err := db.Ping(); err != nil {
+		log.Printf("[DB] Failed to ping: %v", err)
+		db = nil
+		return
+	}
+
+	log.Printf("[DB] Connected to CockroachDB ✓")
 }
 
 func main() {
@@ -235,11 +335,11 @@ func main() {
 		port = "8080"
 	}
 
+	initDB()
+
 	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
 	if webhookURL != "" {
 		log.Printf("Discord webhook configured ✓")
-	} else {
-		log.Printf("No DISCORD_WEBHOOK_URL set — Discord notifications disabled")
 	}
 
 	http.HandleFunc("/health", handleHealth)
