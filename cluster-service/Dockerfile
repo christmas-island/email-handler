@@ -1,7 +1,8 @@
 FROM golang:1.22-alpine AS builder
 WORKDIR /app
+COPY go.mod .
 COPY main.go .
-RUN go mod init email-handler && go build -o email-handler .
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o email-handler .
 
 FROM alpine:3.19
 RUN apk add --no-cache ca-certificates

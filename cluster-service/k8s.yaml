@@ -16,6 +16,8 @@ spec:
       labels:
         app: email-handler
     spec:
+      imagePullSecrets:
+        - name: ghcr-pull-secret
       containers:
         - name: email-handler
           image: ghcr.io/christmas-island/email-handler:latest
@@ -68,18 +70,19 @@ metadata:
   namespace: socials
   annotations:
     cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/use-regex: "true"
 spec:
   ingressClassName: nginx
   tls:
     - hosts:
         - api.only-claws.net
-      secretName: api-only-claws-tls
+      secretName: email-handler-tls
   rules:
     - host: api.only-claws.net
       http:
         paths:
-          - path: /email
-            pathType: Prefix
+          - path: /email(/|$)(.*)
+            pathType: ImplementationSpecific
             backend:
               service:
                 name: email-handler
