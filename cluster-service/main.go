@@ -122,6 +122,18 @@ func storeEmail(email InboundEmail, otps []OTPMatch) (string, error) {
 	return emailID, nil
 }
 
+// Discord bot IDs mapped to their email local parts
+var clawDiscordIDs = map[string]string{
+	"smokeyclaw":  "1479686258560077876",
+	"jakeclaw":    "1475254070989295656",
+	"shopclaw":    "1475320147098206230",
+	"jathyclaw":   "1479742782464852092",
+	"pinchy":      "1472394447139377266",
+	"pinchyclaw":  "1472394447139377266",
+	"nimbleclaw":  "1480458197423886508",
+	"oracleclaw":  "1480458226896994325",
+}
+
 // postToDiscord sends an email notification to the Discord #email channel via webhook
 func postToDiscord(email InboundEmail, otps []OTPMatch) {
 	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
@@ -130,6 +142,12 @@ func postToDiscord(email InboundEmail, otps []OTPMatch) {
 	}
 
 	var sb strings.Builder
+
+	// Tag the claw if we know their Discord ID
+	if discordID, ok := clawDiscordIDs[strings.ToLower(email.LocalPart)]; ok {
+		sb.WriteString(fmt.Sprintf("<@%s> ", discordID))
+	}
+
 	sb.WriteString(fmt.Sprintf("📧 **New email for `%s`**\n", email.To))
 	sb.WriteString(fmt.Sprintf("**From:** %s\n", email.From))
 	sb.WriteString(fmt.Sprintf("**Subject:** %s\n", email.Subject))
