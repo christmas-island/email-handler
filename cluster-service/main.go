@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -75,6 +76,80 @@ func extractOTPs(body string) []OTPMatch {
 	return matches
 }
 
+// postToDiscord sends an email notification to the Discord #email channel via webhook
+func postToDiscord(email InboundEmail, otps []OTPMatch) {
+	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
+	if webhookURL == "" {
+		log.Println("[DISCORD] No webhook URL configured, skipping notification")
+		return
+	}
+
+	// Build the message
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("📧 **New email for `%s`**\n", email.To))
+	sb.WriteString(fmt.Sprintf("**From:** %s\n", email.From))
+	sb.WriteString(fmt.Sprintf("**Subject:** %s\n", email.Subject))
+	sb.WriteString(fmt.Sprintf("**Received:** %s\n", email.ReceivedAt))
+
+	if len(otps) > 0 {
+		sb.WriteString("\n🔑 **Extracted codes/links:**\n")
+		for _, otp := range otps {
+			if otp.Type == "otp" {
+				sb.WriteString(fmt.Sprintf("- **OTP:** `%s`\n", otp.Code))
+			} else {
+				sb.WriteString(fmt.Sprintf("- **Link:** <%s>\n", otp.Code))
+			}
+		}
+	}
+
+	// Extract a preview from the raw email (skip headers, first 500 chars of body)
+	body := extractBody(email.Raw)
+	if len(body) > 500 {
+		body = body[:500] + "..."
+	}
+	if body != "" {
+		sb.WriteString(fmt.Sprintf("\n```\n%s\n```", body))
+	}
+
+	payload := map[string]interface{}{
+		"content":  sb.String(),
+		"username": "📧 Email Handler",
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[DISCORD] Failed to marshal payload: %v", err)
+		return
+	}
+
+	resp, err := http.Post(webhookURL, "application/json", bytes.NewReader(jsonPayload))
+	if err != nil {
+		log.Printf("[DISCORD] Failed to post: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 300 {
+		log.Printf("[DISCORD] Webhook returned %d", resp.StatusCode)
+	} else {
+		log.Printf("[DISCORD] Notification sent for %s", email.To)
+	}
+}
+
+// extractBody tries to get the text body from a raw email, skipping headers
+func extractBody(raw string) string {
+	// Find the blank line separating headers from body
+	parts := strings.SplitN(raw, "\r\n\r\n", 2)
+	if len(parts) == 2 {
+		return strings.TrimSpace(parts[1])
+	}
+	parts = strings.SplitN(raw, "\n\n", 2)
+	if len(parts) == 2 {
+		return strings.TrimSpace(parts[1])
+	}
+	return ""
+}
+
 func handleInbound(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -109,19 +184,19 @@ func handleInbound(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Post to Discord #email channel
+	go postToDiscord(email, otps)
+
 	// Store email record (TODO: persist to DB)
 	record := map[string]interface{}{
-		"to":         email.To,
-		"from":       email.From,
-		"subject":    email.Subject,
-		"localPart":  email.LocalPart,
-		"receivedAt": email.ReceivedAt,
+		"to":          email.To,
+		"from":        email.From,
+		"subject":     email.Subject,
+		"localPart":   email.LocalPart,
+		"receivedAt":  email.ReceivedAt,
 		"processedAt": time.Now().UTC().Format(time.RFC3339),
-		"otps":       otps,
+		"otps":        otps,
 	}
-
-	// TODO: Route to the correct claw via Discord webhook or agent API
-	// For now, log and respond
 	_ = record
 
 	w.Header().Set("Content-Type", "application/json")
@@ -146,8 +221,6 @@ func handleQuery(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// TODO: query stored emails for this localPart
-	// Return most recent OTPs
-
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"ok":        true,
@@ -160,6 +233,13 @@ func main() {
 	port := os.Getenv("PORT")
 	if port == "" {
 		port = "8080"
+	}
+
+	webhookURL := os.Getenv("DISCORD_WEBHOOK_URL")
+	if webhookURL != "" {
+		log.Printf("Discord webhook configured ✓")
+	} else {
+		log.Printf("No DISCORD_WEBHOOK_URL set — Discord notifications disabled")
 	}
 
 	http.HandleFunc("/health", handleHealth)
