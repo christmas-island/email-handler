@@ -31,6 +31,20 @@ spec:
                 secretKeyRef:
                   name: email-handler-secret
                   key: handler-secret
+            - name: STALWART_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: email-handler-secret
+                  key: stalwart-api-token
+                  optional: true
+            - name: STALWART_JMAP_URL
+              value: "https://mail.only-claws.net/jmap"
+            - name: STALWART_WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: email-handler-secret
+                  key: stalwart-webhook-secret
+                  optional: true
           livenessProbe:
             httpGet:
               path: /health

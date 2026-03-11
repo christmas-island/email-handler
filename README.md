@@ -1,54 +1,105 @@
-# 📧 email-handler
+# email-handler
 
-Inbound email handler for `*@only-claws.net` — Cloudflare Email Worker + cluster service.
+Inbound email handler for `*@only-claws.net` — processes incoming emails, extracts OTP codes, persists to CockroachDB, and notifies Discord.
 
 ## Architecture
 
+### Primary Path (Stalwart)
+
 ```
-*@only-claws.net → Cloudflare Email Routing → Email Worker → POST /email/inbound → email-handler (socials namespace)
-                                                    ↓ (fallback)
-                                              forward to Gmail
+Stalwart Mail Server (mail.only-claws.net)
+  → webhook event (message-ingest.received)
+  → POST /email/stalwart-webhook
+  → email-handler fetches full email via JMAP
+  → extract OTPs, store in CRDB, notify Discord
 ```
 
-## Components
+### Legacy Path (Cloudflare — fallback)
 
-### Cloudflare Email Worker (`worker.js`)
-- Catches all `*@only-claws.net` emails
-- POSTs JSON payload to cluster API
-- Falls back to forwarding to Christmas Island Gmail if API is down
+```
+*@only-claws.net → Cloudflare Email Routing → Email Worker → POST /email/inbound → email-handler
+  ↓ (fallback)
+  forward to Gmail
+```
 
-### Cluster Service (`cluster-service/`)
-- Go HTTP server deployed in `socials` namespace
-- `POST /email/inbound` — receives emails from CF Worker
-- `GET /email/query/{clawname}` — claws check their inbox for OTPs
-- `GET /health` — liveness/readiness probe
-- Extracts OTP codes and verification links via regex
+## Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/` | Service status page |
+| `GET` | `/health` | Liveness/readiness probe |
+| `POST` | `/email/stalwart-webhook` | Stalwart webhook receiver (primary) |
+| `POST` | `/email/inbound` | CF Worker inbound (legacy fallback) |
+| `GET` | `/email/query/{clawname}` | Query inbox by local part |
+
+## Features
+
+- **OTP extraction** — regex-based extraction of verification codes and magic links
+- **CockroachDB persistence** — stores all inbound emails and extracted codes
+- **Discord notifications** — posts to Discord webhook, tags claws by name
+- **JMAP integration** — fetches full email content from Stalwart for body analysis
+- **Dual ingest** — accepts emails from both Stalwart webhooks and CF Workers
+
+## Environment Variables
+
+### Required
+
+| Var | Description |
+|-----|-------------|
+| `HANDLER_SECRET` | Shared secret for CF Worker → API auth |
+
+### Stalwart Integration
+
+| Var | Description | Default |
+|-----|-------------|---------|
+| `STALWART_API_TOKEN` | Bearer token for Stalwart JMAP API | — |
+| `STALWART_JMAP_URL` | Stalwart JMAP endpoint | `https://mail.only-claws.net/jmap` |
+| `STALWART_WEBHOOK_SECRET` | Shared secret for webhook auth | — |
+
+### Optional
+
+| Var | Description | Default |
+|-----|-------------|---------|
+| `PORT` | HTTP listen port | `8080` |
+| `DATABASE_URL` | CockroachDB connection string | cluster-internal default |
+| `DISCORD_WEBHOOK_URL` | Discord webhook for notifications | — |
 
 ## Deployment
 
-### CI
 Push to `main` triggers GitHub Actions → builds Docker image → pushes to `ghcr.io/christmas-island/email-handler`.
 
-### Cluster
 Managed by ArgoCD. K8s manifests in `cluster-service/k8s.yaml`.
 
-### Cloudflare Worker
+### Stalwart Webhook Configuration
+
+Configure Stalwart to send webhooks to the email-handler:
+
+1. In Stalwart admin (`https://mail.only-claws.net/`), go to **Settings → Webhooks**
+2. Add a new webhook:
+   - **URL:** `http://email-handler.socials.svc.cluster.local:8080/email/stalwart-webhook`
+   - **Events:** `message-ingest.*`
+   - **Auth:** Bearer token matching `STALWART_WEBHOOK_SECRET`
+
+### Stalwart API Token
+
+Create an API key in Stalwart admin for JMAP access:
+
+1. Go to **Settings → API Keys** (or create a service account)
+2. Generate a token with `jmap-email-get` permissions
+3. Add to k8s secret: `kubectl -n socials create secret generic email-handler-secret --from-literal=stalwart-api-token=<token>`
+
+## CF Worker (Legacy)
+
+The Cloudflare Email Worker is kept as a fallback. To deploy:
+
 ```bash
 cd .
 wrangler deploy
 wrangler secret put HANDLER_SECRET
 ```
 
-## Environment Variables
+### CF Worker Variables
 
-### Cluster Service
-| Var | Description |
-|-----|-------------|
-| `PORT` | HTTP listen port (default: 8080) |
-| `HANDLER_SECRET` | Shared secret for Worker → API auth |
-| `DISCORD_WEBHOOK_URL` | (optional) Post notifications to Discord |
-
-### Cloudflare Worker
 | Var | Description |
 |-----|-------------|
 | `HANDLER_URL` | Cluster API endpoint |
